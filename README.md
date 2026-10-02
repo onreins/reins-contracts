@@ -8,7 +8,7 @@ contract on every trade, not trusted to the agent, to us, or to anyone's server.
 
 These are the contracts behind [Reins](https://reins.one). The app is at
 [app.reins.one](https://app.reins.one), and the agent tooling (SDK and MCP
-server) is in [reins-mcp](https://github.com/ic88t/reins-mcp).
+server) is in [reins-mcp](https://github.com/onreins/reins-mcp).
 
 ## The rules
 
