@@ -1,0 +1,279 @@
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.28;
+
+import {IPriceFeed, ISwapVenue, Mandate} from "./Mandate.sol";
+
+/// Test scaffolding for Mandate. Never deployed outside local tests.
+
+contract MockToken {
+    string public name;
+    string public symbol;
+    uint8 public immutable decimals;
+    uint256 public totalSupply;
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    event Transfer(address indexed from, address indexed to, uint256 value);
+    event Approval(address indexed owner, address indexed spender, uint256 value);
+
+    constructor(string memory symbol_, uint8 decimals_) {
+        name = symbol_;
+        symbol = symbol_;
+        decimals = decimals_;
+    }
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+        totalSupply += amount;
+        emit Transfer(address(0), to, amount);
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        emit Approval(msg.sender, spender, amount);
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        _move(msg.sender, to, amount);
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        uint256 a = allowance[from][msg.sender];
+        require(a >= amount, "allowance");
+        allowance[from][msg.sender] = a - amount;
+        _move(from, to, amount);
+        return true;
+    }
+
+    function _move(address from, address to, uint256 amount) private {
+        require(balanceOf[from] >= amount, "balance");
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+        emit Transfer(from, to, amount);
+    }
+}
+
+/// A Chainlink-shaped feed whose answer and timestamp tests control.
+contract MockFeed is IPriceFeed {
+    uint8 public immutable override decimals;
+    int256 public answer;
+    uint256 public updatedAt;
+
+    constructor(uint8 decimals_, int256 answer_) {
+        decimals = decimals_;
+        answer = answer_;
+        updatedAt = block.timestamp;
+    }
+
+    function set(int256 answer_) external {
+        answer = answer_;
+        updatedAt = block.timestamp;
+    }
+
+    bool public broken;
+
+    function setUpdatedAt(uint256 t) external {
+        updatedAt = t;
+    }
+
+    /// Make every read revert, like a deprecated or paused feed.
+    function setBroken(bool b) external {
+        broken = b;
+    }
+
+    function latestRoundData() external view override returns (uint80, int256, uint256, uint256, uint80) {
+        require(!broken, "feed: broken");
+        return (1, answer, updatedAt, updatedAt, 1);
+    }
+}
+
+/**
+ * An exchange that fills at the oracle price, shifted by `edgeBps` against the
+ * trader (0 = perfectly fair, 300 = 3% worse). It holds its own inventory.
+ * `base` is priced at exactly $1, like the mandate assumes.
+ */
+contract OracleVenue is ISwapVenue {
+    address public immutable base;
+    mapping(address => IPriceFeed) public feedOf;
+    mapping(address => uint8) public decOf;
+    uint16 public edgeBps;
+
+    constructor(address base_, uint8 baseDecimals) {
+        base = base_;
+        decOf[base_] = baseDecimals;
+    }
+
+    function list(address token, IPriceFeed feed, uint8 dec) external {
+        feedOf[token] = feed;
+        decOf[token] = dec;
+    }
+
+    function setEdge(uint16 bps) external {
+        edgeBps = bps;
+    }
+
+    function swap(address tokenIn, address tokenOut, uint256 amountIn, uint256 minOut, address to)
+        external
+        override
+        returns (uint256 amountOut)
+    {
+        require(MockToken(tokenIn).transferFrom(msg.sender, address(this), amountIn), "pull");
+        uint256 usd = _usd(tokenIn, amountIn); // 1e18-scaled dollars
+        amountOut = (_amount(tokenOut, usd) * (10_000 - edgeBps)) / 10_000;
+        require(amountOut >= minOut, "venue: slippage");
+        require(MockToken(tokenOut).transfer(to, amountOut), "push");
+    }
+
+    function _usd(address token, uint256 amount) private view returns (uint256) {
+        uint256 scale = 10 ** decOf[token];
+        if (token == base) return (amount * 1e18) / scale;
+        (, int256 p,,,) = feedOf[token].latestRoundData();
+        return (amount * uint256(p) * 1e18) / (scale * 10 ** feedOf[token].decimals());
+    }
+
+    function _amount(address token, uint256 usd) private view returns (uint256) {
+        uint256 scale = 10 ** decOf[token];
+        if (token == base) return (usd * scale) / 1e18;
+        (, int256 p,,,) = feedOf[token].latestRoundData();
+        return (usd * scale * 10 ** feedOf[token].decimals()) / (uint256(p) * 1e18);
+    }
+}
+
+/// A hostile venue: while holding the approval, it calls back into the mandate,
+/// either to trade again or to trip the stop-loss while balances look low.
+contract ReenteringVenue is ISwapVenue {
+    Mandate public target;
+    address public tokenA;
+    address public tokenB;
+    bool public viaCheckpoint;
+
+    function aim(Mandate target_, address a, address b, bool viaCheckpoint_) external {
+        target = target_;
+        tokenA = a;
+        tokenB = b;
+        viaCheckpoint = viaCheckpoint_;
+    }
+
+    function swap(address, address, uint256, uint256, address) external override returns (uint256) {
+        if (viaCheckpoint) target.checkpoint();
+        else target.trade(tokenA, tokenB, 1, 0);
+        return 0;
+    }
+}
+
+/// A venue that takes the tokens and sends nothing back, while claiming it did.
+contract ThiefVenue is ISwapVenue {
+    function swap(address tokenIn, address, uint256 amountIn, uint256, address) external override returns (uint256) {
+        require(MockToken(tokenIn).transferFrom(msg.sender, address(this), amountIn), "pull");
+        return type(uint256).max;
+    }
+}
+
+/// An exchange that can never beat the floor the mandate hands it, refusing
+/// with the same custom error UniswapV4Venue raises on Arc. Used to check that
+/// the SDK explains a venue-level refusal instead of surfacing raw revert data.
+contract StingyVenue is ISwapVenue {
+    error InsufficientOutput(uint256 out, uint256 minOut);
+
+    function swap(address, address, uint256, uint256 minOut, address) external pure override returns (uint256) {
+        revert InsufficientOutput(0, minOut);
+    }
+}
+
+/**
+ * An ERC-20 that returns no data from transfer, transferFrom and approve, the
+ * way USDT does. Any caller that insists on decoding a bool reverts against it.
+ */
+contract NoReturnToken {
+    string public symbol;
+    uint8 public immutable decimals;
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    constructor(string memory symbol_, uint8 decimals_) {
+        symbol = symbol_;
+        decimals = decimals_;
+    }
+
+    function mint(address to, uint256 amount) external {
+        balanceOf[to] += amount;
+    }
+
+    function approve(address spender, uint256 amount) external {
+        allowance[msg.sender][spender] = amount;
+    }
+
+    function transfer(address to, uint256 amount) external {
+        _move(msg.sender, to, amount);
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external {
+        uint256 a = allowance[from][msg.sender];
+        require(a >= amount, "NoReturnToken: allowance");
+        if (a != type(uint256).max) allowance[from][msg.sender] = a - amount;
+        _move(from, to, amount);
+    }
+
+    function _move(address from, address to, uint256 amount) private {
+        require(balanceOf[from] >= amount, "NoReturnToken: balance");
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+    }
+}
+
+/**
+ * A transfer-restricted share, in the shape tokenized equities take: an
+ * allowlist decides who may hold it, and a transfer touching anyone else
+ * reverts. The issuer can revoke a holder at any time.
+ */
+contract RestrictedToken {
+    string public symbol;
+    uint8 public immutable decimals;
+    address public immutable issuer;
+    mapping(address => bool) public allowed;
+    mapping(address => uint256) public balanceOf;
+    mapping(address => mapping(address => uint256)) public allowance;
+
+    constructor(string memory symbol_, uint8 decimals_) {
+        symbol = symbol_;
+        decimals = decimals_;
+        issuer = msg.sender;
+    }
+
+    function setAllowed(address who, bool ok) external {
+        require(msg.sender == issuer, "RestrictedToken: not issuer");
+        allowed[who] = ok;
+    }
+
+    function mint(address to, uint256 amount) external {
+        require(allowed[to], "RestrictedToken: not allowed");
+        balanceOf[to] += amount;
+    }
+
+    function approve(address spender, uint256 amount) external returns (bool) {
+        allowance[msg.sender][spender] = amount;
+        return true;
+    }
+
+    function transfer(address to, uint256 amount) external returns (bool) {
+        _move(msg.sender, to, amount);
+        return true;
+    }
+
+    function transferFrom(address from, address to, uint256 amount) external returns (bool) {
+        uint256 a = allowance[from][msg.sender];
+        require(a >= amount, "RestrictedToken: allowance");
+        if (a != type(uint256).max) allowance[from][msg.sender] = a - amount;
+        _move(from, to, amount);
+        return true;
+    }
+
+    function _move(address from, address to, uint256 amount) private {
+        require(allowed[from] && allowed[to], "RestrictedToken: not allowed");
+        require(balanceOf[from] >= amount, "RestrictedToken: balance");
+        balanceOf[from] -= amount;
+        balanceOf[to] += amount;
+    }
+}

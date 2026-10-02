@@ -1,0 +1,23 @@
+{
+  "name": "reins-contracts",
+  "version": "1.0.0",
+  "description": "Mandate: a smart contract that holds an AI agent's USDC on Arc under rules the agent can't break.",
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "node scripts/compile.js",
+    "chain": "hardhat node --port 8545",
+    "test": "node --test --test-concurrency=1 \"test/*.test.js\"",
+    "sim:mainnet": "node scripts/sim-mainnet.js"
+  },
+  "dependencies": {
+    "solc": "0.8.28",
+    "viem": "^2.56.8"
+  },
+  "devDependencies": {
+    "hardhat": "^2.29.1"
+  }
+}
